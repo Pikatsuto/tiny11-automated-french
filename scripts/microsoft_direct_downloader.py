@@ -41,20 +41,22 @@ class MicrosoftPlaywrightDownloader:
     _agent_pool = []
     _agent_index = 0
     
-    def __init__(self, headless: bool = True, timeout: int = 60000, min_delay: float = 1.0, max_delay: float = 3.0):
+    def __init__(self, headless: bool = True, timeout: int = 60000, min_delay: float = 1.0, max_delay: float = 3.0, language: str = "French"):
         """
         Initialize Playwright downloader
-        
+
         Args:
             headless: Run browser in headless mode
             timeout: Page load timeout in milliseconds
             min_delay: Minimum delay between actions (seconds)
             max_delay: Maximum delay between actions (seconds)
+            language: Language label as displayed in the Microsoft dropdown (e.g. "French", "English (United States)")
         """
         self.headless = headless
         self.timeout = timeout
         self.min_delay = min_delay
         self.max_delay = max_delay
+        self.language = language
         
         # Initialize agent pool if empty
         if not MicrosoftPlaywrightDownloader._agent_pool:
@@ -143,17 +145,34 @@ class MicrosoftPlaywrightDownloader:
                 
                 self._random_delay(0.5, 1.5)
                 
-                # Step 4: Select English (United States)
+                # Step 4: Select the requested language
                 # NOTE: We select by label to ensure we get the correct language regardless of list order
-                logger.info(f"✅ Selecting language: English (United States)...")
-                
-                # Try English (United States) first, then fallback to English International
-                try:
-                    page.select_option('#product-languages', label='English (United States)')
-                except Exception as e:
-                    logger.warning(f"Could not select 'English (United States)': {e}")
-                    logger.info("Trying 'English International'...")
-                    page.select_option('#product-languages', label='English International')
+                logger.info(f"✅ Selecting language: {self.language}...")
+
+                # Try the requested label, with sensible fallbacks for French / English
+                fallback_labels = {
+                    'French': ['Français', 'French (France)'],
+                    'English': ['English (United States)', 'English International'],
+                    'English (United States)': ['English International'],
+                }.get(self.language, [])
+
+                attempted = [self.language] + fallback_labels
+                last_error = None
+                selected = False
+                for label in attempted:
+                    try:
+                        page.select_option('#product-languages', label=label)
+                        logger.info(f"✅ Selected language label: {label}")
+                        selected = True
+                        break
+                    except Exception as e:
+                        logger.warning(f"Could not select '{label}': {e}")
+                        last_error = e
+
+                if not selected:
+                    available = page.locator('#product-languages option').all_text_contents()
+                    logger.error(f"❌ No matching language label found. Available: {available}")
+                    raise last_error if last_error else RuntimeError("Language selection failed")
                 
                 self._random_delay(0.5, 1.0)
                 
@@ -287,9 +306,33 @@ def test_playwright_download():
 
 
 if __name__ == '__main__':
-    # Enable INFO logging for test
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(description="Fetch a fresh direct Windows 11 ISO download URL from Microsoft.")
+    parser.add_argument('--language', default='French',
+                        help="Language label as shown in the MS dropdown (default: French). Examples: French, English (United States), Spanish, German.")
+    parser.add_argument('--test', action='store_true',
+                        help="Run the verbose self-test instead of just printing the URL.")
+    parser.add_argument('--quiet', action='store_true',
+                        help="Suppress logging on stderr; only print the URL on stdout.")
+    args = parser.parse_args()
+
+    log_level = logging.WARNING if args.quiet else logging.INFO
     logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s'
+        level=log_level,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        stream=sys.stderr,
     )
-    test_playwright_download()
+
+    if args.test:
+        test_playwright_download()
+        sys.exit(0)
+
+    downloader = MicrosoftPlaywrightDownloader(headless=True, language=args.language)
+    url = downloader.get_windows11_link()
+    if not url:
+        print("ERROR: failed to retrieve direct download URL", file=sys.stderr)
+        sys.exit(1)
+    # Stdout = URL only, so callers can capture it cleanly.
+    print(url)
