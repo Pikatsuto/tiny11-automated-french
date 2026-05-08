@@ -113,18 +113,47 @@ class MicrosoftPlaywrightDownloader:
                 
                 # Navigate to download page
                 logger.info(f"📥 Navigating to: {self.DOWNLOAD_PAGE}")
-                page.goto(self.DOWNLOAD_PAGE, wait_until='domcontentloaded', timeout=self.timeout)
-                
-                # Step 1: Wait for and select product edition dropdown
-                logger.info(f"⏳ Waiting for product edition dropdown (#product-edition)...")
-                page.wait_for_selector('#product-edition', timeout=self.timeout)
-                
+                page.goto(self.DOWNLOAD_PAGE, wait_until='networkidle', timeout=self.timeout)
+
+                # Cookie / consent banner: try to dismiss it if present (best effort).
+                for label in ("Accept", "Accept all", "Tout accepter", "I Accept", "Accepter"):
+                    try:
+                        btn = page.get_by_role("button", name=label, exact=False)
+                        if btn.count() > 0:
+                            btn.first.click(timeout=2000)
+                            logger.info(f"🍪 Dismissed cookie banner via '{label}'")
+                            break
+                    except Exception:
+                        pass
+
+                # Step 1: Wait for the actual option to be populated (not just the <select> shell).
+                # Microsoft fills the dropdown via JS after load, so we must wait for the option to exist.
+                # Match by visible label (substring "multi-edition") rather than the numeric value,
+                # because Microsoft changes the value periodically (was 3262, then 3321, ...).
+                logger.info(f"⏳ Waiting for product edition dropdown to populate...")
+                page.wait_for_function(
+                    "Array.from(document.querySelectorAll('#product-edition option')).some(o => o.textContent.toLowerCase().includes('multi-edition'))",
+                    timeout=self.timeout,
+                )
+
                 # Random delay before selection to mimic human behavior
                 self._random_delay(0.5, 1.5)
-                
-                # Select Windows 11 multi-edition ISO (value="3262")
-                logger.info(f"✅ Selecting Windows 11 multi-edition (value=3262)...")
-                page.select_option('#product-edition', value='3262')
+
+                # Select Windows 11 multi-edition ISO by matching the label substring.
+                logger.info(f"✅ Selecting Windows 11 multi-edition ISO...")
+                edition_options = page.locator('#product-edition option').all()
+                multi_edition_value = None
+                for opt in edition_options:
+                    text = (opt.text_content() or "").lower()
+                    if "multi-edition" in text:
+                        multi_edition_value = opt.get_attribute('value')
+                        logger.info(f"   Resolved to value={multi_edition_value!r} ({opt.text_content()!r})")
+                        break
+                if not multi_edition_value:
+                    available = [(o.get_attribute('value'), o.text_content()) for o in edition_options]
+                    logger.error(f"❌ Multi-edition option not found. Available: {available}")
+                    raise RuntimeError("Could not find the Windows 11 multi-edition ISO entry in the product dropdown")
+                page.select_option('#product-edition', value=multi_edition_value)
                 
                 self._random_delay(0.5, 1.0)
                 
@@ -135,10 +164,14 @@ class MicrosoftPlaywrightDownloader:
                 # Wait for network activity to settle
                 self._random_delay(2.0, 4.0)
                 
-                # Step 3: Wait for language dropdown to appear
-                logger.info(f"⏳ Waiting for language dropdown (#product-languages)...")
+                # Step 3: Wait for the language dropdown to actually be populated (more than just a placeholder).
+                logger.info(f"⏳ Waiting for language dropdown to populate...")
                 page.wait_for_selector('#product-languages', timeout=self.timeout)
-                
+                page.wait_for_function(
+                    "document.querySelector('#product-languages') && document.querySelector('#product-languages').options.length > 1",
+                    timeout=self.timeout,
+                )
+
                 # Get all available languages for logging
                 language_options = page.locator('#product-languages option').all_text_contents()
                 logger.info(f"🌍 Found {len(language_options)} language options")
