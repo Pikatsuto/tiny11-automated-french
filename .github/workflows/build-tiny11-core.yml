@@ -13,9 +13,9 @@ on:
         required: false
         default: '25H2'
       windows_iso_url:
-        description: 'Windows 11 ISO download URL'
-        required: true
-        default: 'https://software.download.prss.microsoft.com/dbazure/Win11_25H2_English_x64.iso?t=641a9719-5089-48d3-b683-44d9012b040e&P1=1765893811&P2=601&P3=2&P4=kPgTlzFR6%2bt9lzW6l2ITzVyc3%2fMHiCzaC5YMwf3RcQH%2bXezCHitvttx2e91%2fT%2bPcXPxVLKAYbeqrAW2mZozm1q%2bTjC4JYdInC0gROdmtKH2X84U99HD1RzRhTXmFi7lemqPDAHcOZ4yx95AzW6rzMvQF2QBsmSE%2fl5l8bWupChqEd28LHdjMXrSu3otYpyxc8S4cFluEgaLD2mkPCrqX61ij2PUrqiZM2jq%2bbz5Fx3kNXCZ3Z1pJkfKKQGb3T%2fvbbWfu7avjuU2kBDJjyeecJH3MGeTP9jsbT6oIHU95AL05%2bA43il%2f4rGDNcFGji1logGrKYi%2f%2b2fDpCFuGh9rN5w%3d%3d'
+        description: 'Windows 11 ISO download URL (laisser vide pour récupérer automatiquement depuis Microsoft selon la langue)'
+        required: false
+        default: ''
       image_index:
         description: 'Windows image index (1=Home, 4=Education, 6=Pro, 7=Pro N)'
         required: true
@@ -27,9 +27,9 @@ on:
           - '6'
           - '7'
       language:
-        description: 'Language (e.g., English, Spanish, French)'
+        description: 'Language label MS (French, English (United States), Spanish, German, ...)'
         required: false
-        default: 'English'
+        default: 'French'
       skip_cleanup:
         description: 'Skip cleanup (for debugging)'
         required: false
@@ -108,9 +108,31 @@ jobs:
           python-version: '3.11'
 
       - name: Install Python dependencies
-        run: pip install requests
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Resolve Windows 11 ISO URL
+        shell: pwsh
+        run: |
+          $providedUrl = "${{ github.event.inputs.windows_iso_url }}"
+          if (-not [string]::IsNullOrWhiteSpace($providedUrl)) {
+            Write-Output "Using URL provided as workflow input."
+            Add-Content -Path $env:GITHUB_ENV -Value "RESOLVED_ISO_URL=$providedUrl"
+          } else {
+            $lang = "${{ github.event.inputs.language }}"
+            Write-Output "No URL provided — fetching fresh URL from Microsoft for language: $lang"
+            $url = python scripts/microsoft_direct_downloader.py --language "$lang" --quiet
+            if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($url)) {
+              Write-Error "Failed to retrieve a fresh ISO URL from Microsoft."
+              exit 1
+            }
+            Write-Output "Retrieved URL (truncated): $($url.Substring(0, [Math]::Min(120, $url.Length)))..."
+            Add-Content -Path $env:GITHUB_ENV -Value "RESOLVED_ISO_URL=$url"
+          }
 
       - name: Discord - Build Started
+        if: false
         continue-on-error: true
         run: |
           python scripts/discord_notify.py `
@@ -176,7 +198,7 @@ jobs:
       - name: Download Windows 11 ISO
         shell: powershell
         run: |
-          $url = "${{ github.event.inputs.windows_iso_url }}"
+          $url = $env:RESOLVED_ISO_URL
           $output = "Win11_Source.iso"
 
           Write-Output "Downloading Windows 11 ISO from Microsoft servers..."
@@ -420,7 +442,7 @@ jobs:
           Add-Content -Path $env:GITHUB_ENV -Value "ISO_MD5=$md5"
 
       - name: Discord - Build Completed
-        if: success()
+        if: false
         continue-on-error: true
         run: |
           # Get ISO size
@@ -475,17 +497,10 @@ jobs:
       - name: Check upload configuration
         id: check-upload
         shell: powershell
-        env:
-          SF_KEY: ${{ secrets.SF_SSH_KEY }}
-          ENABLE_UPLOAD: ${{ vars.ENABLE_SOURCEFORGE_UPLOAD }}
         run: |
-          if ($env:ENABLE_UPLOAD -eq 'true' -or -not [string]::IsNullOrWhiteSpace($env:SF_KEY)) {
-            Write-Output "Upload condition met."
-            "DO_UPLOAD=true" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8
-          } else {
-            Write-Output "Upload condition NOT met. Fallback to artifacts."
-            "DO_UPLOAD=false" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8
-          }
+          # SourceForge upload disabled — using GitHub artifacts as the default.
+          Write-Output "SourceForge upload disabled. Using GitHub artifacts."
+          "DO_UPLOAD=false" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8
 
       - name: Display final warnings
         shell: powershell
@@ -637,7 +652,8 @@ jobs:
             Write-Output "SSH key cleaned up"
           }
           
-      - name: Upload ISO as artifact (fallback)
+      - name: Upload ISO as artifact
+        id: upload-iso-artifact
         if: env.DO_UPLOAD != 'true'
         uses: actions/upload-artifact@v4
         with:
@@ -649,6 +665,17 @@ jobs:
             ${{ env.ISO_NAME }}.txt
           retention-days: 7
           compression-level: 0
+
+      - name: Expose artifact URL
+        if: env.DO_UPLOAD != 'true'
+        shell: pwsh
+        run: |
+          $artifactUrl = "${{ steps.upload-iso-artifact.outputs.artifact-url }}"
+          if ([string]::IsNullOrWhiteSpace($artifactUrl)) {
+            $artifactUrl = "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          }
+          Write-Output "Artifact URL: $artifactUrl"
+          Add-Content -Path $env:GITHUB_ENV -Value "ARTIFACT_URL=$artifactUrl"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -667,7 +694,9 @@ jobs:
             - **Workflow Run:** [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
 
             ### 📥 Download
-            ${{ secrets.SF_SSH_KEY != '' && format('**SourceForge:** [{0}]({1})', env.ISO_NAME, env.SF_DOWNLOAD_URL) || '**GitHub Artifacts:** Check workflow run for download' }}
+            **GitHub Artifact:** [${{ env.ISO_NAME }}](${{ env.ARTIFACT_URL }})
+
+            > Le téléchargement nécessite d'être connecté à GitHub. Disponible 7 jours.
 
             ### 💿 Image Details
             | Property | Value |
@@ -751,7 +780,7 @@ jobs:
           - **.NET 3.5:** ${{ github.event.inputs.enable_dotnet35 }}
 
           ## 📥 Download
-          ${{ secrets.SF_SSH_KEY != '' && format('🔗 **SourceForge:** [{0}]({1})', env.ISO_NAME, env.SF_DOWNLOAD_URL) || '🔗 **GitHub Artifacts:** Available in workflow run' }}
+          🔗 **GitHub Artifact:** [$env:ISO_NAME]($env:ARTIFACT_URL)
 
           ## 🔒 Checksums
           **SHA256:** ``````
@@ -778,7 +807,7 @@ jobs:
           Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $summary
 
       - name: Discord - Build Failed
-        if: failure()
+        if: false
         continue-on-error: true
         run: |
           python scripts/discord_notify.py `
